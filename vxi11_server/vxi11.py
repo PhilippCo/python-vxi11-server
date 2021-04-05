@@ -30,6 +30,12 @@ import random
 import re
 import struct
 import time
+import threading
+import ipaddress
+import socketserver
+import logging
+
+logger = logging.getLogger(__name__)
 
 # VXI-11 RPC constants
 
@@ -61,6 +67,8 @@ DESTROY_INTR_CHAN = 26
 DEVICE_INTR_PROG  = 0x0607b1
 DEVICE_INTR_VERS  = 1
 DEVICE_INTR_SRQ   = 30
+DEVICE_TCP        = 0
+DEVICE_UDP        = 1
 
 # Error states
 ERR_NO_ERROR = 0
@@ -193,7 +201,7 @@ class Packer(rpc.Packer):
         self.pack_int(id)
         self.pack_bool(lock_device)
         self.pack_uint(lock_timeout)
-        self.pack_string(device.encode('ascii', 'ignore'))
+        self.pack_string(device)
 
     def pack_device_write_parms(self, params):
         link, timeout, lock_timeout, flags, data = params
@@ -201,7 +209,7 @@ class Packer(rpc.Packer):
         self.pack_uint(timeout)
         self.pack_uint(lock_timeout)
         self.pack_int(flags)
-        self.pack_opaque(data.encode('ascii', 'ignore'))
+        self.pack_opaque(data)
 
     def pack_device_read_parms(self, params):
         link, request_size, timeout, lock_timeout, flags, term_char = params
@@ -232,8 +240,8 @@ class Packer(rpc.Packer):
         self.pack_int(link)
         self.pack_bool(enable)
         if len(handle) > 40:
-            raise Vxi11Exception("array length too long")
-        self.pack_opaque(handle.encode('ascii', 'ignore'))
+            raise Vxi11Exception(ERR_PARAMETER_ERROR, "array length too long")
+        self.pack_opaque(handle)
 
     def pack_device_lock_parms(self, params):
         link, flags, lock_timeout = params
@@ -250,12 +258,12 @@ class Packer(rpc.Packer):
         self.pack_int(cmd)
         self.pack_bool(network_order)
         self.pack_int(datasize)
-        self.pack_opaque(data_in.encode('ascii', 'ignore'))
+        self.pack_opaque(data_in)
 
     def pack_device_error(self, error):
         self.pack_int(error)
 
-    def pack_device_srq_parms(self, params):
+    def pack_device_intr_srq_parms(self, params):
         handle = params
         self.pack_opaque(handle)
 
@@ -278,7 +286,7 @@ class Packer(rpc.Packer):
         self.pack_device_error(error)
         #self.pack_int(error)
         self.pack_int(reason)
-        self.pack_opaque(data.encode('ascii', 'ignore'))
+        self.pack_opaque(data)
 
     def pack_device_read_stb_resp(self, params):
         error, stb = params
@@ -290,7 +298,7 @@ class Packer(rpc.Packer):
         error, data_out = params
         self.pack_device_error(error)
         #self.pack_int(error)
-        self.pack_opaque(data_out.encode('ascii', 'ignore'))
+        self.pack_opaque(data_out)
 
 class Unpacker(rpc.Unpacker):
     def unpack_device_link(self):
@@ -308,7 +316,7 @@ class Unpacker(rpc.Unpacker):
         timeout = self.unpack_uint()
         lock_timeout = self.unpack_uint()
         flags = self.unpack_int()
-        data = self.unpack_opaque().decode("ascii", "ignore")
+        data = self.unpack_opaque()
         return link, timeout, lock_timeout, flags, data
 
     def unpack_device_read_parms(self):
@@ -338,7 +346,7 @@ class Unpacker(rpc.Unpacker):
     def unpack_device_enable_srq_parms(self):
         link = self.unpack_int()
         enable = self.unpack_bool()
-        handle = self.unpack_opaque().decode("ascii", "ignore")
+        handle = self.unpack_opaque()
         return link, enable, handle
 
     def unpack_device_lock_parms(self):
@@ -355,14 +363,14 @@ class Unpacker(rpc.Unpacker):
         cmd = self.unpack_int()
         network_order = self.unpack_bool()
         datasize = self.unpack_int()
-        data_in = self.unpack_opaque().decode("ascii", "ignore")
+        data_in = self.unpack_opaque()
         return link, flags, timeout, lock_timeout, cmd, network_order, datasize, data_in
 
     def unpack_device_error(self):
         return self.unpack_int()
 
-    def unpack_device_srq_params(self):
-        handle = self.unpack_opaque().decode("ascii", "ignore")
+    def unpack_device_intr_srq_params(self):
+        handle = self.unpack_opaque()
         return handle
 
     def unpack_create_link_resp(self):
@@ -380,7 +388,7 @@ class Unpacker(rpc.Unpacker):
     def unpack_device_read_resp(self):
         error = self.unpack_int()
         reason = self.unpack_int()
-        data = self.unpack_opaque().decode("ascii", "ignore")
+        data = self.unpack_opaque()
         return error, reason, data
 
     def unpack_device_read_stb_resp(self):
@@ -390,7 +398,7 @@ class Unpacker(rpc.Unpacker):
 
     def unpack_device_docmd_resp(self):
         error = self.unpack_int()
-        data_out = self.unpack_opaque().decode("ascii", "ignore")
+        data_out = self.unpack_opaque()
         return error, data_out
 
     def done(self):
@@ -503,7 +511,72 @@ class AbortClient(rpc.TCPClient):
                 self.packer.pack_device_link,
                 self.unpacker.unpack_device_error)
 
+class TCPIntrClient(rpc.TCPClient):
+    def __init__(self, host, port ):
+        self.packer = Packer()
+        self.unpacker = Unpacker('')
+        rpc.TCPClient.__init__(self, host, DEVICE_INTR_PROG, DEVICE_INTR_VERS, port)
 
+    def signal_intr_srq(self, handle):
+        return self.make_call(DEVICE_INTR_SRQ, handle,
+                self.packer.pack_device_intr_srq_parms, None )
+    
+class IntrHandler(rpc.RPCRequestHandler):
+    
+    def addpackers(self):
+        # amend rpc packers with our vxi11 packers
+        self.packer = Packer()
+        self.unpacker = Unpacker('')
+
+    def handle_30(self):
+        # SRQ
+        params = self.unpacker.unpack_device_intr_srq_params()
+        handle = params
+
+        # find the device to send SRQ to via handle and registry
+        self.server.SRQ_CLASS_REGISTRY[handle].srq_callback()
+        # nothing to pack but void
+        self.turn_around()
+        
+class IntrServer(socketserver.ThreadingMixIn, rpc.TCPServer):
+    INTR_SERVER=None
+    SRQ_CLASS_REGISTRY={}
+
+    @classmethod
+    def getServer(cls):
+        # create global interrupt server instance if it does not exist
+        if cls.INTR_SERVER is None:
+            # create a new server task and register our handler
+            serv=cls.INTR_SERVER=IntrServer('',0) # default addr, new random port
+            intrThread = threading.Thread(target=serv.serve_forever)
+            intrThread.setDaemon(True) # don't hang on exit
+            intrThread.start()
+            logger.info('IntrServer started...')
+        else:
+            serv=cls.INTR_SERVER
+        return serv
+
+    @classmethod
+    def stopServer(cls):
+        cls.INTR_SERVER.shutdown()
+        cls.INTR_SERVER.server_close()
+
+    @classmethod
+    def register_dev(cls,handle,device):
+        cls.SRQ_CLASS_REGISTRY[handle]=device
+
+    @classmethod
+    def unregister_dev(cls, handle):
+        del cls.SRQ_CLASS_REGISTRY[handle]
+
+    @classmethod
+    def has_dev(cls,handle):
+        return handle in cls.SRQ_CLASS_REGISTRY
+
+    def __init__(self, host, port ):
+        rpc.TCPServer.__init__(self, host, DEVICE_INTR_PROG, DEVICE_INTR_VERS, port, IntrHandler)
+
+        
 def list_devices(ip=None, timeout=1):
     "Detect VXI-11 devices on network"
 
@@ -575,6 +648,7 @@ class Device(object):
 
         self.client = None
         self.abort_client = None
+        self.srq_callback=None
 
         self.host = host
         self.name = name
@@ -642,6 +716,8 @@ class Device(object):
         if self.link is None:
             return
 
+        self.disable_srq_handler()
+        
         self.client.destroy_link(self.link)
         self.client.close()
         self.link = None
@@ -831,8 +907,6 @@ class Device(object):
         if self.link is None:
             self.open()
 
-        flags = 0
-
         error = self.client.device_unlock(self.link)
 
         if error:
@@ -840,6 +914,54 @@ class Device(object):
 
         self.locked = False
 
+    def enable_srq_handler(self):
+        " enable srq handling for this device"
+
+        logger.info("setting up srq handler")
+        if self.link is None:
+            raise Vxi11Exception(ERR_DEVICE_NOT_ACCESSIBLE,"link not open")
+
+        serv=IntrServer.getServer()
+
+        # this is tricky, we need the device to connect
+        # to the ip address of our network-interface that is communicating with the device
+
+        # so just ask the open socket to the device for our own ip address.
+        intr_host, _  = self.client.sock.getsockname()
+        # and use the port from our intrserver instance
+        _, intr_port = serv.server_address
+        logger.info("intr handler connect to %s, %i"% (intr_host,intr_port))
+        
+        # tell the device to enable interrupt services
+        error=self.client.create_intr_chan(int(ipaddress.IPv4Address(intr_host)),
+                                           intr_port, DEVICE_INTR_PROG,DEVICE_INTR_VERS,DEVICE_TCP)
+        if error:
+            raise Vxi11Exception(error, 'device can not create interrupt channel')
+        
+        # enable SRQ on the device
+        handle=struct.pack("!L",self.client_id)
+        IntrServer.register_dev(handle,self)
+        error=self.client.device_enable_srq(self.link,True,handle)
+        if error:
+            raise Vxi11Exception(error, 'device can not enable SRQ handling')
+
+    def disable_srq_handler(self):
+        # disable srq handling and remove old handler
+        handle=struct.pack("!L",self.client_id)
+        if IntrServer.has_dev(handle):
+            self.client.device_enable_srq(self.link,False,handle)
+            IntrServer.unregister_dev(handle)
+            self.client.destroy_intr_chan()
+            
+    def on_srq(self,callback):
+        # start the intr channel for srq, the instrument should connect,
+        # and if the handler runs it sould trigger our callback somehow
+        if callback is None:
+            self.disable_srq_handler()
+            self.srq_callback=None
+        else:
+            self.enable_srq_handler()
+            self.srq_callback=callback
 
 class InterfaceDevice(Device):
     "VXI-11 IEEE 488.1 interface device interface client"
